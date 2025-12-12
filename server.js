@@ -1,4 +1,4 @@
-// server.js (ESM) ----------------------------------------------------------
+// server.js ------------------------------------------------------------------
 import express from "express";
 import axios from "axios";
 import cors from "cors";
@@ -22,209 +22,195 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "200kb" }));
 
-// simple rate limiter (per IP)
-app.use(
-  rateLimit({
-    windowMs: 60_000,
-    max: 60, // 60 requests per minute per IP
-    standardHeaders: true,
-    legacyHeaders: false,
-  })
-);
+// Ensure data.json exists
+async function ensureDataFile() {
+  try {
+    await fs.access(DATA_FILE);
+  } catch {
+    await fs.writeFile(DATA_FILE, JSON.stringify({ users: {}, sessions: {} }, null, 2));
+  }
+}
+await ensureDataFile();
 
-// Utility: load/save data.json (users, sessions, quotas)
+// Rate limiter (compatible with express-rate-limit v6)
+const limiter = rateLimit({
+  windowMs: 60_000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);
+
+// Utility: load/save data.json
 async function readData() {
   try {
     const txt = await fs.readFile(DATA_FILE, "utf8");
     return JSON.parse(txt);
-  } catch (e) {
-    return { users: {}, sessions: {} }; // default shape
+  } catch {
+    return { users: {}, sessions: {} };
   }
 }
 async function writeData(data) {
   await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// Default quotas per tier (requests/day). You can change to token-based later.
+// Tiers
 const TIERS = {
   free: { requestsPerDay: 5 },
   basic: { requestsPerDay: 100 },
   pro: { requestsPerDay: 500 },
-  premium: { requestsPerDay: Infinity }, // unlimited
+  premium: { requestsPerDay: Infinity },
 };
 
-// Helper: ensure user exist
+// Create user if missing
 async function ensureUser(userId) {
   const data = await readData();
   if (!data.users[userId]) {
     data.users[userId] = {
       id: userId,
-      tier: "free", // default; WP integration should set this
-      extraRequests: 0, // paid add-on tokens/requests
+      tier: "free",
+      extraRequests: 0,
       usage: { date: new Date().toISOString().slice(0, 10), count: 0 },
     };
     await writeData(data);
   } else {
-    // reset daily usage if date changed
     const today = new Date().toISOString().slice(0, 10);
     if (data.users[userId].usage?.date !== today) {
       data.users[userId].usage = { date: today, count: 0 };
       await writeData(data);
     }
   }
-  return;
 }
 
-// Check & consume quota (returns {ok, remaining, allowed})
+// Consume quota
 async function consumeQuota(userId) {
   const data = await readData();
   const user = data.users[userId];
   if (!user) return { ok: false, reason: "user_not_found" };
 
-  const tier = user.tier || "free";
-  const allowed = TIERS[tier]?.requestsPerDay ?? 0;
-  const extra = user.extraRequests || 0;
-  const used = user.usage?.count || 0;
+  const tier = user.tier;
+  const allowed = TIERS[tier].requestsPerDay;
+  const extra = user.extraRequests;
+  const used = user.usage.count;
 
   if (allowed === Infinity) return { ok: true, remaining: Infinity };
 
   if (used < allowed) {
-    user.usage.count = used + 1;
+    user.usage.count++;
     await writeData(data);
     return { ok: true, remaining: allowed - user.usage.count };
   }
 
   if (extra > 0) {
-    user.extraRequests = extra - 1;
+    user.extraRequests--;
     await writeData(data);
     return { ok: true, remaining: 0 };
   }
 
-  return { ok: false, reason: "quota_exhausted", remaining: 0 };
+  return { ok: false, reason: "quota_exhausted" };
 }
 
-// Save message to session (keep last N messages)
+// Push session messages
 const MAX_SESSION_MSGS = 12;
 async function pushSession(userId, role, content) {
   const data = await readData();
-  data.sessions = data.sessions || {};
   data.sessions[userId] = data.sessions[userId] || [];
   data.sessions[userId].push({ role, content, ts: Date.now() });
-  // keep last MAX_SESSION_MSGS
   if (data.sessions[userId].length > MAX_SESSION_MSGS) {
     data.sessions[userId] = data.sessions[userId].slice(-MAX_SESSION_MSGS);
   }
   await writeData(data);
 }
 
-// GET history for user
+// GET history
 app.get("/api/history", async (req, res) => {
   const userId = req.query.userId;
-  if (!userId) return res.status(400).json({ error: "userId fehlend" });
+  if (!userId) return res.status(400).json({ error: "userId fehlt" });
   const data = await readData();
-  const sessions = data.sessions?.[userId] || [];
-  return res.json({ history: sessions });
+  return res.json({ history: data.sessions[userId] || [] });
 });
 
-// Admin: reset usage (secure this in production)
+// ADMIN: reset usage
 app.post("/api/admin/resetUsage", async (req, res) => {
-  // Simple protection: require ADMIN_KEY in .env
-  if (req.headers["x-admin-key"] !== process.env.ADMIN_KEY) {
+  if (req.headers["x-admin-key"] !== process.env.ADMIN_KEY)
     return res.status(403).json({ error: "forbidden" });
-  }
+
   const data = await readData();
-  Object.keys(data.users || {}).forEach((id) => {
-    data.users[id].usage = { date: new Date().toISOString().slice(0, 10), count: 0 };
+  const today = new Date().toISOString().slice(0, 10);
+  Object.keys(data.users).forEach(id => {
+    data.users[id].usage = { date: today, count: 0 };
   });
   await writeData(data);
-  return res.json({ ok: true });
+  res.json({ ok: true });
 });
 
-// MAIN: chat endpoint
+// MAIN /api/chat
 app.post("/api/chat", async (req, res) => {
   try {
     const { userId = "guest", message, system, temperature = 0.7, max_tokens = 300 } = req.body;
-    if (!message || typeof message !== "string") return res.status(400).json({ error: "message fehlt" });
 
-    // ensure user
+    if (!message) return res.status(400).json({ error: "message fehlt" });
+
     await ensureUser(userId);
-
-    // consume quota
     const q = await consumeQuota(userId);
     if (!q.ok) return res.status(429).json({ error: "Quota exhausted", details: q });
 
-    // assemble messages (session memory + system)
     const data = await readData();
-    const session = data.sessions?.[userId] || [];
-    const messages = [];
+    const session = data.sessions[userId] || [];
 
-    // optional system prompt from UI or default
-    messages.push({
-      role: "system",
-      content:
-        system ||
-        "Du bist ein moderner, freundlicher Business-Assistent. Antworte knapp, klar und gib bei Bedarf Emojis, Beispiele und Copy zum Kopieren."
-    });
+    const messages = [
+      {
+        role: "system",
+        content:
+          system ||
+          "Du bist ein moderner, freundlicher Business-Assistent. Antworte knapp, klar, modern."
+      },
+      ...session,
+      { role: "user", content: message }
+    ];
 
-    // include session memory
-    session.forEach((m) => {
-      messages.push({ role: m.role, content: m.content });
-    });
-
-    // push current user message
-    messages.push({ role: "user", content: message });
-
-    // call OpenAI
     const payload = {
-      model: process.env.OPENAI_MODEL || OPENAI_MODEL,
+      model: OPENAI_MODEL,
       messages,
-      temperature: parseFloat(temperature),
-      max_tokens: parseInt(max_tokens, 10),
+      temperature: Number(temperature),
+      max_tokens: Number(max_tokens),
     };
 
     const openaiRes = await axios.post("https://api.openai.com/v1/chat/completions", payload, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
       timeout: 120000,
     });
 
-    const reply = openaiRes.data?.choices?.[0]?.message?.content ?? "(keine Antwort)";
+    const reply = openaiRes.data.choices?.[0]?.message?.content || "(keine Antwort)";
 
-    // save to session memory (user + ai)
     await pushSession(userId, "user", message);
     await pushSession(userId, "assistant", reply);
 
-    // respond structured (copy-friendly), keep emojis intact
-    return res.json({
+    res.json({
       ok: true,
       reply,
-      meta: {
-        userId,
-        remainingRequests: q.remaining ?? null,
-      },
+      meta: { userId, remainingRequests: q.remaining },
     });
   } catch (err) {
     console.error("ERROR /api/chat:", err.response?.data || err.message);
-    return res.status(500).json({ error: "server_error", details: err.response?.data || err.message });
+    res.status(500).json({ error: "server_error", details: err.response?.data || err.message });
   }
 });
 
-// endpoint to create/update user tier (called from WP backend when membership changes)
+// update tier
 app.post("/api/user/updateTier", async (req, res) => {
   const { userId, tier, extraRequests } = req.body;
   if (!userId) return res.status(400).json({ error: "userId fehlt" });
+
   const data = await readData();
-  data.users = data.users || {};
-  data.users[userId] = data.users[userId] || { id: userId, usage: { date: new Date().toISOString().slice(0, 10), count: 0 } };
-  data.users[userId].tier = tier || data.users[userId].tier || "free";
+  data.users[userId] = data.users[userId] || { id: userId };
+  if (tier) data.users[userId].tier = tier;
   if (typeof extraRequests === "number") data.users[userId].extraRequests = extraRequests;
+
   await writeData(data);
-  return res.json({ ok: true, user: data.users[userId] });
+  res.json({ ok: true, user: data.users[userId] });
 });
 
-// quick health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => console.log(`🚀 Cashly AI Server läuft auf http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Cashly AI läuft auf Port ${PORT}`));
