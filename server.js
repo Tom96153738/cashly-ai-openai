@@ -1,4 +1,3 @@
-// server.js ------------------------------------------------------------------
 import express from "express";
 import axios from "axios";
 import cors from "cors";
@@ -6,12 +5,13 @@ import rateLimit from "express-rate-limit";
 import fs from "fs/promises";
 import path from "path";
 import dotenv from "dotenv";
+import cron from "node-cron";
 dotenv.config();
 
 const DATA_FILE = path.resolve("./data.json");
 const PORT = process.env.PORT || 3000;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
 
 if (!OPENAI_KEY) {
   console.error("ERROR: OPENAI_API_KEY fehlt in .env");
@@ -32,7 +32,7 @@ async function ensureDataFile() {
 }
 await ensureDataFile();
 
-// Rate limiter (compatible with express-rate-limit v6)
+// Rate limiter
 const limiter = rateLimit({
   windowMs: 60_000,
   max: 60,
@@ -40,6 +40,24 @@ const limiter = rateLimit({
   legacyHeaders: false,
 });
 app.use(limiter);
+
+// Täglicher Reset um 0 Uhr
+cron.schedule('0 0 * * *', async () => {
+  try {
+    const data = await readData();
+    const today = new Date().toISOString().slice(0, 10);
+    Object.keys(data.users).forEach(id => {
+      data.users[id].usage = { date: today, count: 0 };
+    });
+    await writeData(data);
+    console.log("✅ Täglicher Reset erfolgreich durchgeführt");
+  } catch (err) {
+    console.error("❌ Fehler beim täglichen Reset:", err);
+  }
+}, {
+  timezone: "Europe/Berlin" // optional, damit es genau um Mitternacht MEZ passiert
+});
+
 
 // Utility: load/save data.json
 async function readData() {
@@ -54,12 +72,14 @@ async function writeData(data) {
   await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-// Tiers
-const TIERS = {
-  free: { requestsPerDay: 5 },
-  basic: { requestsPerDay: 100 },
-  pro: { requestsPerDay: 500 },
-  premium: { requestsPerDay: Infinity },
+// Level IDs und Mapping
+const LEVELS = {
+  4: { name: "Cashly Starter Lifetime", requestsPerDay: 5, model: "gpt-4.1-mini" },
+  5: { name: "Cashly Claimer Lifetime", requestsPerDay: 20, model: "gpt-4.1-mini" },
+  2: { name: "Cashly Claimer(ABO)", requestsPerDay: 20, model: "gpt-4.1-mini" },
+  6: { name: "Cashly Winner Lifetime", requestsPerDay: Infinity, model: "gpt-4.1" },
+  3: { name: "Cashly Winner(ABO)", requestsPerDay: Infinity, model: "gpt-4.1" },
+  11:{ name: "Cashly Unlimed", requestsPerDay: Infinity, model: "gpt-4.1" },
 };
 
 // Create user if missing
@@ -68,7 +88,7 @@ async function ensureUser(userId) {
   if (!data.users[userId]) {
     data.users[userId] = {
       id: userId,
-      tier: "free",
+      levelId: 4, // default Starter
       extraRequests: 0,
       usage: { date: new Date().toISOString().slice(0, 10), count: 0 },
     };
@@ -82,14 +102,14 @@ async function ensureUser(userId) {
   }
 }
 
-// Consume quota
+// Consume quota per level
 async function consumeQuota(userId) {
   const data = await readData();
   const user = data.users[userId];
   if (!user) return { ok: false, reason: "user_not_found" };
 
-  const tier = user.tier;
-  const allowed = TIERS[tier].requestsPerDay;
+  const level = LEVELS[user.levelId] || LEVELS[4];
+  const allowed = level.requestsPerDay;
   const extra = user.extraRequests;
   const used = user.usage.count;
 
@@ -120,6 +140,14 @@ async function pushSession(userId, role, content) {
     data.sessions[userId] = data.sessions[userId].slice(-MAX_SESSION_MSGS);
   }
   await writeData(data);
+}
+
+// Modern business emojis mapping
+function modernEmoji(text) {
+  return text
+    .replace(/🚀/g, "💼")
+    .replace(/💡/g, "📊")
+    .replace(/📦/g, "📁");
 }
 
 // GET history
@@ -157,20 +185,21 @@ app.post("/api/chat", async (req, res) => {
 
     const data = await readData();
     const session = data.sessions[userId] || [];
+    const level = LEVELS[data.users[userId].levelId] || LEVELS[4];
 
     const messages = [
       {
         role: "system",
         content:
           system ||
-          "Du bist ein moderner, freundlicher Business-Assistent. Antworte knapp, klar, modern."
+          modernEmoji("Du bist ein moderner, freundlicher Business-Assistent. Antworte knapp, klar, modern. 🚀💡📦")
       },
       ...session,
       { role: "user", content: message }
     ];
 
     const payload = {
-      model: OPENAI_MODEL,
+      model: level.model,
       messages,
       temperature: Number(temperature),
       max_tokens: Number(max_tokens),
@@ -181,7 +210,7 @@ app.post("/api/chat", async (req, res) => {
       timeout: 120000,
     });
 
-    const reply = openaiRes.data.choices?.[0]?.message?.content || "(keine Antwort)";
+    const reply = modernEmoji(openaiRes.data.choices?.[0]?.message?.content || "(keine Antwort)");
 
     await pushSession(userId, "user", message);
     await pushSession(userId, "assistant", reply);
@@ -197,14 +226,14 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-// update tier
-app.post("/api/user/updateTier", async (req, res) => {
-  const { userId, tier, extraRequests } = req.body;
+// update levelId / extraRequests
+app.post("/api/user/updateLevel", async (req, res) => {
+  const { userId, levelId, extraRequests } = req.body;
   if (!userId) return res.status(400).json({ error: "userId fehlt" });
 
   const data = await readData();
   data.users[userId] = data.users[userId] || { id: userId };
-  if (tier) data.users[userId].tier = tier;
+  if (levelId) data.users[userId].levelId = levelId;
   if (typeof extraRequests === "number") data.users[userId].extraRequests = extraRequests;
 
   await writeData(data);
