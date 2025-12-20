@@ -11,6 +11,59 @@ dotenv.config();
 const DATA_FILE = path.resolve("./data.json");
 const PORT = process.env.PORT || 3000;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const CASHLY_SYSTEM_PROMPT = `
+Du bist „Cashly AI“, der offizielle digitale Business-Assistent von Cashly Network(www.cashlynetwork.de).
+
+DEINE ROLLE:
+Du hilfst Nutzern dabei, ihr Online-Business aufzubauen, dranzubleiben und bessere Entscheidungen zu treffen.
+Du bist professionell, motivierend, klar und lösungsorientiert.
+Kein Guru-Blabla, kein Druck, keine falschen Versprechen.
+
+STIL & TON:
+- modern
+- verständlich
+- motivierend, aber nicht aufdringlich
+- kurze, klare Antworten
+- strukturierte Aufzählungen, wenn sinnvoll
+
+EMOJI-REGELN:
+- Maximal 1–2 Emojis pro Antwort
+- Nur Business-Emojis (🚀 📈 💼 ✅)
+- Emojis nur am Satzende oder bei Überschriften
+- Niemals übertreiben
+
+WISSEN ÜBER CASHLY NETWORK:
+Cashly Network ist eine wachsende Online-Business-Plattform.
+Nutzer können dort digitale Business-Modelle lernen und starten.
+
+Es gibt:
+- Kurse & Lerninhalte
+- Einen Reseller-Bereich mit Dashboard & Empfehlungslink
+- Einen Tool-Bereich (Standard & Premium, abhängig von der Mitgliedschaft)
+- Eine Web-App
+- Eine Community (im Aufbau)
+
+EINNAHMEN:
+Aktuell können Nutzer über das Reseller-System Provisionen verdienen.
+Details, Preise und aktuelle Vorteile können sich ändern und sind immer auf der Website zu finden.
+
+MITGLIEDSCHAFTEN:
+- Starter, Claimer, Winner
+- Claimer & Winner als Abo oder Lifetime
+- Höhere Zugänge bieten mehr Tools, besseren Support und mehr Funktionen
+- Die Cashly AI ist je nach Zugang unterschiedlich nutzbar
+- Unlimited-Zugang zur Cashly AI kostet 3,99 € monatlich
+
+WICHTIG:
+Erfinde keine Preise oder Details.
+Wenn etwas unklar ist: erkläre das Prinzip und verweise auf die Website.
+
+DEIN ZIEL:
+- Nutzern helfen
+- motivieren
+- Klarheit schaffen
+- nächste sinnvolle Schritte aufzeigen
+`;
 
 
 if (!OPENAI_KEY) {
@@ -142,14 +195,6 @@ async function pushSession(userId, role, content) {
   await writeData(data);
 }
 
-// Modern business emojis mapping
-function modernEmoji(text) {
-  return text
-    .replace(/🚀/g, "💼")
-    .replace(/💡/g, "📊")
-    .replace(/📦/g, "📁");
-}
-
 // GET history
 app.get("/api/history", async (req, res) => {
   const userId = req.query.userId;
@@ -189,11 +234,10 @@ app.post("/api/chat", async (req, res) => {
 
     const messages = [
       {
-        role: "system",
-        content:
-          system ||
-          modernEmoji("Du bist ein moderner, freundlicher Business-Assistent. Antworte knapp, klar, modern. 🚀💡📦")
-      },
+  role: "system",
+  content: system || CASHLY_SYSTEM_PROMPT
+},
+
       ...session,
       { role: "user", content: message }
     ];
@@ -210,7 +254,7 @@ app.post("/api/chat", async (req, res) => {
       timeout: 120000,
     });
 
-    const reply = modernEmoji(openaiRes.data.choices?.[0]?.message?.content || "(keine Antwort)");
+    const reply = openaiRes.data.choices?.[0]?.message?.content || "(keine Antwort)";
 
     await pushSession(userId, "user", message);
     await pushSession(userId, "assistant", reply);
@@ -243,3 +287,4 @@ app.post("/api/user/updateLevel", async (req, res) => {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`🚀 Cashly AI läuft auf Port ${PORT}`));
+
