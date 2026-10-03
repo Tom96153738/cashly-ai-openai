@@ -1,373 +1,385 @@
+import crypto from "node:crypto";
 import express from "express";
-import axios from "axios";
-import cors from "cors";
-import rateLimit from "express-rate-limit";
-import fs from "fs/promises";
-import path from "path";
-import dotenv from "dotenv";
-import cron from "node-cron";
-dotenv.config();
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import helmet from "helmet";
+import OpenAI, { toFile } from "openai";
+import { z } from "zod";
 
-const DATA_FILE = path.resolve("./data.json");
-const PORT = process.env.PORT || 3000;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const CASHLY_SYSTEM_PROMPT = `
-Du bist „Cashly AI“, der offizielle digitale Business-Assistent von Cashly Network(www.cashlynetwork.de).
+const VERSION = "2.1.0";
+const PORT = Number(process.env.PORT || 3000);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const SHARED_SECRET = process.env.CASHLY_SHARED_SECRET || "";
+const STANDARD_MODEL = process.env.OPENAI_MODEL_STANDARD || process.env.OPENAI_MODEL_FAST || "gpt-6-luna";
+const PLUS_MODEL = process.env.OPENAI_MODEL_PLUS || process.env.OPENAI_MODEL_DEFAULT || "gpt-6.1-sol";
+const DEEP_MODEL = process.env.OPENAI_MODEL_DEEP || "gpt-6.1-sol";
+const SIGNATURE_TOLERANCE_SECONDS = 300;
 
-DEINE ROLLE:
-Du hilfst Nutzern dabei, ihr Online-Business aufzubauen, dranzubleiben und bessere Entscheidungen zu treffen.
-Du bist professionell, motivierend, klar und lösungsorientiert.
-Kein Guru-Blabla, kein Druck, keine falschen Versprechen.
-Antworte wie ein erfahrener Online-Business-Berater – nicht wie ein Bot, nicht wie ein FAQ.
-
-Regeln:
-- Verweise NICHT pauschal auf Websites
-- Sage NICHT „informiere dich auf der Website"
-- Wenn Infos fehlen: erkläre das Prinzip verständlich
-
-STIL & TON:
-- modern
-- verständlich
-- motivierend, aber nicht aufdringlich
-- kurze, klare Antworten
-- strukturierte Aufzählungen, wenn sinnvoll
-
-KEINE EMOJIS:
-- Verwende unter keinen Umständen Emojis oder Sonderzeichen wie 🚀, ✅, 📈 etc.
-- Nutze ausschließlich normalen Text (Buchstaben, Zahlen, Satzzeichen)
-- Auch keine versteckten oder indirekten Emojis
-- Falls du ein Emoji verwenden würdest: ersetze es durch ein passendes Wort
-
-WISSEN ÜBER CASHLY NETWORK:
-
-Cashly Network ist eine moderne Plattform für den Aufbau eines eigenen Online-Business.
-
-Ziel ist es, Nutzern eine klare Struktur, bewährte Strategien und die notwendigen Tools zu geben, um online Einnahmen zu generieren.
-
-Die Plattform kombiniert:
-- Lerninhalte
-- praktische Umsetzung
-- und Monetarisierungsmöglichkeiten
-
----
-
-MITGLIEDSCHAFTEN:
-
-1. Cashly Learn:
-- Zugang zu allen grundlegenden Lerninhalten
-- Videos, Leitfäden und Schritt-für-Schritt-Anleitungen
-- Fokus: Verstehen, wie Online-Business funktioniert
-- Ideal für Einsteiger ohne Vorkenntnisse
-
----
-
-2. Cashly Market:
-- Enthält alles aus Cashly Learn
-- Zusätzlich Zugriff auf den Cashly Marktplatz
-- Nutzer können digitale Produkte direkt weiterempfehlen
-- Provision: ca. 20% pro erfolgreicher Empfehlung
-
----
-
-3. Cashly Network (All-in-One):
-- Enthält alles aus Cashly Learn und Cashly Market
-- Zugriff auf zusätzliche Tools und Funktionen
-- Möglichkeit, Digital Reselling aktiv umzusetzen
-
-Digital Reselling bedeutet:
-- Digitale Produkte werden weiterempfohlen und verkauft
-- Kein eigenes Produkt notwendig
-- Fokus liegt auf Vertrieb und Reichweite
-
-Vergütung:
-- ca. 30% Provision auf direkte Empfehlungen
-- zusätzlich ca. 15% Team-Provision möglich
-
-Team-Provision bedeutet:
-- Wenn ein Nutzer andere Personen einlädt
-- und diese ebenfalls aktiv werden
-- kann er an deren Umsätzen beteiligt werden
-
-Wichtig:
-- Kein Zwang zur Teamstruktur
-- Fokus bleibt auf eigenem Business
-
----
-
-UPGRADES:
-
-Es gibt zusätzliche Erweiterungen:
-- Cashly Network Pro
-- Cashly Network Plus
-
-Diese bieten:
-- erweiterte Funktionen
-- mehr Support
-- zusätzliche Optimierungen
-
-Details können sich ändern.
-
----
-
-EINSTIEG / START:
-
-Wenn ein Nutzer neu ist, sollte er:
-
-1. Die Serie „Lerne Cashly Network kennen“ auf der Startseite anschauen
-2. Die Grundlagen verstehen
-3. Danach erste Schritte in Richtung Umsetzung gehen
-
----
-
-EINKOMMENSMÖGLICHKEITEN:
-
-Nutzer können über verschiedene Wege Geld verdienen:
-- Empfehlungen von digitalen Produkten
-- Nutzung des Marktplatzes
-- Aufbau eines eigenen Vertriebs
-- Kombination aus Lernen und direkter Umsetzung
-
-VERHALTEN BEI NEUEN NUTZERN:
-Wenn ein Nutzer unsicher ist oder nicht weiß, wie er starten soll:
-- erkläre kurz die nächsten Schritte
-- halte es einfach
-- überfordere nicht mit zu vielen Optionen
-
-DEIN ZIEL:
-- Nutzern helfen
-- motivieren
-- Klarheit schaffen
-- nächste sinnvolle Schritte aufzeigen
-
-ANTWORTSTRUKTUR:
-- Direkt auf den Punkt antworten
-- Keine unnötigen Einleitungen
-- Wenn sinnvoll: Stichpunkte nutzen
-- Immer einen nächsten sinnvollen Schritt nennen
-`;
-
-
-if (!OPENAI_KEY) {
-  console.error("ERROR: OPENAI_API_KEY fehlt in .env");
+if (!OPENAI_API_KEY || !SHARED_SECRET) {
+  console.error("OPENAI_API_KEY und CASHLY_SHARED_SECRET muessen gesetzt sein.");
   process.exit(1);
 }
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "200kb" }));
-
-// Ensure data.json exists
-async function ensureDataFile() {
-  try {
-    await fs.access(DATA_FILE);
-  } catch {
-    await fs.writeFile(DATA_FILE, JSON.stringify({ users: {}, sessions: {} }, null, 2));
-  }
-}
-await ensureDataFile();
-
-// Rate limiter
-const limiter = rateLimit({
-  windowMs: 60_000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use(limiter);
-
-// Täglicher Reset um 0 Uhr
-cron.schedule('0 0 * * *', async () => {
-  try {
-    const data = await readData();
-    const today = new Date().toISOString().slice(0, 10);
-    Object.keys(data.users).forEach(id => {
-      data.users[id].usage = { date: today, count: 0 };
-    });
-    await writeData(data);
-    console.log("✅ Täglicher Reset erfolgreich durchgeführt");
-  } catch (err) {
-    console.error("❌ Fehler beim täglichen Reset:", err);
-  }
-}, {
-  timezone: "Europe/Berlin" // optional, damit es genau um Mitternacht MEZ passiert
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+  timeout: 90_000,
+  maxRetries: 2,
 });
 
+const modeSchema = z.enum(["general", "market", "reseller"]);
+const planSchema = z.enum(["standard", "plus"]);
+const analysisModeSchema = z.enum(["standard", "deep"]);
+const historyMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  content: z.string().trim().min(1).max(20_000),
+}).strict();
 
-// Utility: load/save data.json
-async function readData() {
-  try {
-    const txt = await fs.readFile(DATA_FILE, "utf8");
-    return JSON.parse(txt);
-  } catch {
-    return { users: {}, sessions: {} };
-  }
-}
-async function writeData(data) {
-  await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
-}
+const chatSchema = z.object({
+  requestId: z.string().trim().min(12).max(120),
+  userId: z.string().trim().min(1).max(120),
+  chatId: z.string().trim().min(1).max(160),
+  mode: modeSchema,
+  plan: planSchema.default("standard"),
+  analysisMode: analysisModeSchema.default("standard"),
+  message: z.string().trim().min(1).max(4_000),
+  history: z.array(historyMessageSchema).max(30).default([]),
+  knowledgeContext: z.string().max(24_000).default(""),
+  vectorStoreId: z.string().regex(/^vs_[A-Za-z0-9_-]+$/).optional().or(z.literal("")),
+}).strict();
 
-// Level IDs und Mapping
-const LEVELS = {
-  4: { name: "Cashly Starter Lifetime", requestsPerDay: 5, model: "gpt-4.1-mini" },
-  5: { name: "Cashly Claimer Lifetime", requestsPerDay: 20, model: "gpt-4.1-mini" },
-  2: { name: "Cashly Claimer(ABO)", requestsPerDay: 20, model: "gpt-4.1-mini" },
-  6: { name: "Cashly Winner Lifetime", requestsPerDay: Infinity, model: "gpt-4.1" },
-  3: { name: "Cashly Winner(ABO)", requestsPerDay: Infinity, model: "gpt-4.1" },
-  11:{ name: "Cashly Unlimed", requestsPerDay: Infinity, model: "gpt-4.1" },
+const knowledgeDocumentSchema = z.object({
+  id: z.string().trim().min(1).max(120),
+  title: z.string().trim().min(1).max(240),
+  url: z.string().url().max(2_000).optional().or(z.literal("")),
+  content: z.string().trim().min(20).max(120_000),
+  hash: z.string().trim().max(128).optional(),
+}).strict();
+
+const knowledgeSyncSchema = z.object({
+  requestId: z.string().trim().min(12).max(120),
+  previousVectorStoreId: z.string().regex(/^vs_[A-Za-z0-9_-]+$/).optional().or(z.literal("")),
+  documents: z.array(knowledgeDocumentSchema).min(1).max(40),
+}).strict();
+
+const MODE_PROMPTS = {
+  general: `
+MODUS: ALLGEMEIN
+Hilf bei Orientierung, Planung, Lernen und der sinnvollen Nutzung von Cashly Network.
+Erklaere Zusammenhaenge einfach, ohne sie unnoetig zu vereinfachen.
+Wenn eine Anfrage klar zum Cashly Market oder Cashly Reseller gehoert, beantworte sie trotzdem hilfreich und weise knapp auf den passenderen Modus hin.
+`,
+  market: `
+MODUS: CASHLY MARKET
+Du bist auf die Vermarktung physischer Produkte aus dem Cashly Market spezialisiert.
+Unterstuetze bei Produktauswahl, Zielgruppen, Positionierung, Content-Ideen, Hooks, Kurzvideo-Skripten, Facebook-Inhalten, organischem Marketing, Kampagnen und Auswertung.
+Die Market-Provision betraegt laut aktuellem Cashly-Grundwissen 20 Prozent direkt und enthaelt keine passive Provision. Nenne diese Werte nur, wenn sie durch den bereitgestellten Wissenskontext bestaetigt werden.
+Erfinde keine Produkteigenschaften, Lieferzeiten, Preise, Gesundheitswirkungen oder Garantien. Frage nach fehlenden Produktdaten.
+Formuliere Werbung ehrlich, konkret und passend zur Zielgruppe. Vermeide Spam, Druck, falsche Knappheit und unrealistische Versprechen.
+`,
+  reseller: `
+MODUS: CASHLY RESELLER
+Du bist auf die serioese Empfehlung von Cashly Network spezialisiert.
+Unterstuetze bei Zielgruppen, Akquise, persoenlichen Nachrichten, Content, Gespraechsleitfaeden, Bedarfsermittlung, Einwandbehandlung, Follow-ups und Abschlussvorbereitung.
+Nutze ausschliesslich aktuelle Provisions-, Mitgliedschafts- und Leistungsdaten aus dem bereitgestellten Cashly-Wissen. Erfinde keine Leistungen oder Verguetungen.
+Fuehre Verkauf beratend: Situation verstehen, Bedarf klaeren, Nutzen passend erklaeren, offene Fragen beantworten und einen ehrlichen naechsten Schritt anbieten.
+Mache niemals Einkommensgarantien und stelle Cashly nicht als risikofreien oder automatischen Verdienst dar.
+`,
 };
 
-// Create user if missing
-async function ensureUser(userId) {
-  const data = await readData();
-  if (!data.users[userId]) {
-    data.users[userId] = {
-      id: userId,
-      levelId: 4, // default Starter
-      extraRequests: 0,
-      usage: { date: new Date().toISOString().slice(0, 10), count: 0 },
-    };
-    await writeData(data);
-  } else {
-    const today = new Date().toISOString().slice(0, 10);
-    if (data.users[userId].usage?.date !== today) {
-      data.users[userId].usage = { date: today, count: 0 };
-      await writeData(data);
-    }
+const BASE_PROMPT = `
+Du bist Cashly AI, der digitale Business-Assistent von Cashly Network.
+
+ARBEITSWEISE
+- Antworte auf Deutsch, direkt, hochwertig und handlungsorientiert.
+- Nutze keine Emojis, keine ASCII-Art und keine dekorativen Trennlinien.
+- Gib zuerst die konkrete Antwort. Erklaere danach nur, was fuer die Umsetzung wichtig ist.
+- Verwende klare Abschnitte und kurze Listen, wenn sie das Lesen verbessern.
+- Stelle hoechstens eine notwendige Rueckfrage. Mache ansonsten sinnvolle, klar benannte Annahmen.
+- Wenn der Nutzer einen Text, Plan oder ein Skript verlangt, liefere eine direkt verwendbare Fassung.
+- Trenne Fakten, Empfehlungen und Annahmen sauber voneinander.
+
+VERBINDLICHKEIT
+- Der bereitgestellte Cashly-Wissenskontext und abgerufene Cashly-Quellen haben Vorrang vor deinem allgemeinen Wissen.
+- Wenn Cashly-Informationen fehlen oder widerspruechlich sind, sage das offen. Erfinde nichts.
+- Verweise nur auf Links und Bereiche, die im Wissenskontext vorkommen.
+- Mache keine unbelegten Einkommens-, Erfolgs-, Gesundheits- oder Produktversprechen.
+- Bei rechtlichen, steuerlichen, medizinischen oder finanziellen Fragen gib allgemeine Orientierung und empfehle bei konkreten Entscheidungen fachkundige Beratung.
+
+VERKAUF
+- Arbeite bedarfsorientiert, ehrlich und konkret.
+- Hilf dabei, Zielgruppe, Problem, gewuenschten Zustand, Nutzen, Beleg und naechsten Schritt zu verbinden.
+- Passe Kanal, Ton und Handlungsaufforderung an die Situation an.
+- Vermeide manipulative Aussagen, Massennachrichten und kuenstlichen Druck.
+`;
+
+function normalizeHistory(history) {
+  return history.slice(-24).map((item) => ({ role: item.role, content: item.content }));
+}
+
+function pickModel(message, mode, plan, analysisMode) {
+  const normalized = message.toLowerCase();
+  const simpleSignals = ["kuerzer", "umschreiben", "titel", "drei hooks", "korrigiere", "zusammenfassen"];
+
+  if (analysisMode === "deep") {
+    return { model: DEEP_MODEL, reasoning: "high", route: "deep", maxOutputTokens: 3_200 };
+  }
+  if (plan === "plus") {
+    return { model: PLUS_MODEL, reasoning: mode === "general" ? "medium" : "high", route: "plus", maxOutputTokens: 2_200 };
+  }
+  if (mode === "general" && message.length < 260 && simpleSignals.some((term) => normalized.includes(term))) {
+    return { model: STANDARD_MODEL, reasoning: "low", route: "fast", maxOutputTokens: 1_400 };
+  }
+  return { model: STANDARD_MODEL, reasoning: mode === "general" ? "low" : "medium", route: "standard", maxOutputTokens: 1_800 };
+}
+
+function safeEqualHex(first, second) {
+  if (!/^[a-f0-9]{64}$/i.test(first || "") || !/^[a-f0-9]{64}$/i.test(second || "")) return false;
+  return crypto.timingSafeEqual(Buffer.from(first, "hex"), Buffer.from(second, "hex"));
+}
+
+const replayCache = new Map();
+
+function purgeReplayCache(now = Date.now()) {
+  for (const [requestId, expiresAt] of replayCache.entries()) {
+    if (expiresAt <= now) replayCache.delete(requestId);
   }
 }
 
-// Consume quota per level
-async function consumeQuota(userId) {
-  const data = await readData();
-  const user = data.users[userId];
-  if (!user) return { ok: false, reason: "user_not_found" };
+function requireSignature(req, res, next) {
+  const timestamp = req.get("x-cashly-timestamp") || "";
+  const signature = req.get("x-cashly-signature") || "";
+  const timestampNumber = Number(timestamp);
+  const nowSeconds = Math.floor(Date.now() / 1000);
 
-  const level = LEVELS[user.levelId] || LEVELS[4];
-  const allowed = level.requestsPerDay;
-  const extra = user.extraRequests;
-  const used = user.usage.count;
-
-  if (allowed === Infinity) return { ok: true, remaining: Infinity };
-
-  if (used < allowed) {
-    user.usage.count++;
-    await writeData(data);
-    return { ok: true, remaining: allowed - user.usage.count };
+  if (!Number.isInteger(timestampNumber) || Math.abs(nowSeconds - timestampNumber) > SIGNATURE_TOLERANCE_SECONDS) {
+    return res.status(401).json({ ok: false, error: "invalid_signature" });
   }
 
-  if (extra > 0) {
-    user.extraRequests--;
-    await writeData(data);
-    return { ok: true, remaining: 0 };
+  const expected = crypto.createHmac("sha256", SHARED_SECRET)
+    .update(`${timestamp}.${req.rawBody || ""}`)
+    .digest("hex");
+
+  if (!safeEqualHex(signature, expected)) {
+    return res.status(401).json({ ok: false, error: "invalid_signature" });
   }
 
-  return { ok: false, reason: "quota_exhausted" };
+  const requestId = req.body?.requestId;
+  purgeReplayCache();
+  if (requestId && replayCache.has(requestId)) {
+    return res.status(409).json({ ok: false, error: "duplicate_request" });
+  }
+  if (requestId) replayCache.set(requestId, Date.now() + SIGNATURE_TOLERANCE_SECONDS * 1_000);
+  return next();
 }
 
-// Push session messages
-const MAX_SESSION_MSGS = 12;
-async function pushSession(userId, role, content) {
-  const data = await readData();
-  data.sessions[userId] = data.sessions[userId] || [];
-  data.sessions[userId].push({ role, content, ts: Date.now() });
-  if (data.sessions[userId].length > MAX_SESSION_MSGS) {
-    data.sessions[userId] = data.sessions[userId].slice(-MAX_SESSION_MSGS);
-  }
-  await writeData(data);
+function buildInstructions(mode, knowledgeContext, plan, analysisMode) {
+  const knowledge = knowledgeContext.trim()
+    ? `\nVERBINDLICHES CASHLY-WISSEN\n${knowledgeContext.trim()}\n`
+    : "\nEs wurde kein zusaetzlicher Cashly-Wissenskontext bereitgestellt. Behaupte keine konkreten Cashly-Leistungen, Preise oder Verguetungen.\n";
+  const quality = plan === "plus"
+    ? "\nQUALITAET: CASHLY AI PLUS\nArbeite besonders praezise. Pruefe Zusammenhaenge, passe Empfehlungen an den Kontext an und liefere belastbare naechste Schritte statt allgemeiner Floskeln.\n"
+    : "\nQUALITAET: STANDARD\nAntworte klar, nuetzlich und kompakt.\n";
+  const depth = analysisMode === "deep"
+    ? "\nTIEFENANALYSE\nAnalysiere Ziel, Ausgangslage, Annahmen, Optionen, Risiken und Prioritaeten. Begruende die Empfehlung und schliesse mit einem konkreten Umsetzungsplan. Bleibe trotz der Tiefe fokussiert.\n"
+    : "";
+  return `${BASE_PROMPT}\n${MODE_PROMPTS[mode]}\n${quality}${depth}${knowledge}`;
 }
 
-// GET history
-app.get("/api/history", async (req, res) => {
-  const userId = req.query.userId;
-  if (!userId) return res.status(400).json({ error: "userId fehlt" });
-  const data = await readData();
-  return res.json({ history: data.sessions[userId] || [] });
-});
+function logEvent(event, details = {}) {
+  console.log(JSON.stringify({ time: new Date().toISOString(), event, ...details }));
+}
 
-// ADMIN: reset usage
-app.post("/api/admin/resetUsage", async (req, res) => {
-  if (req.headers["x-admin-key"] !== process.env.ADMIN_KEY)
-    return res.status(403).json({ error: "forbidden" });
-
-  const data = await readData();
-  const today = new Date().toISOString().slice(0, 10);
-  Object.keys(data.users).forEach(id => {
-    data.users[id].usage = { date: today, count: 0 };
+async function syncKnowledge(documents) {
+  const vectorStore = await openai.vectorStores.create({
+    name: `Cashly Knowledge ${new Date().toISOString()}`,
   });
-  await writeData(data);
-  res.json({ ok: true });
+
+  try {
+    for (const document of documents) {
+      const safeName = `${document.id.replace(/[^A-Za-z0-9_-]/g, "_")}.txt`;
+      const file = await openai.files.create({
+        file: await toFile(
+          Buffer.from(`Titel: ${document.title}\nQuelle: ${document.url || "Cashly Admin"}\n\n${document.content}`, "utf8"),
+          safeName,
+          { type: "text/plain" },
+        ),
+        purpose: "assistants",
+      });
+
+      await openai.vectorStores.files.createAndPoll(vectorStore.id, {
+        file_id: file.id,
+        attributes: {
+          source_id: document.id.slice(0, 120),
+          source_url: (document.url || "").slice(0, 500),
+          source_hash: (document.hash || "").slice(0, 120),
+        },
+      });
+    }
+    return vectorStore.id;
+  } catch (error) {
+    await deleteVectorStoreWithFiles(vectorStore.id);
+    throw error;
+  }
+}
+
+async function deleteVectorStoreWithFiles(vectorStoreId) {
+  if (!vectorStoreId) return;
+  const fileIds = [];
+
+  try {
+    for await (const item of openai.vectorStores.files.list(vectorStoreId, { limit: 100 })) {
+      if (item.id) fileIds.push(item.id);
+    }
+  } catch (error) {
+    logEvent("knowledge.cleanup_list_failed", { vectorStoreId, error: error?.name || "Error" });
+  }
+
+  await openai.vectorStores.delete(vectorStoreId).catch(() => {});
+  await Promise.all(fileIds.map((fileId) => openai.files.delete(fileId).catch(() => {})));
+}
+
+const app = express();
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(rateLimit({
+  windowMs: 60_000,
+  limit: 120,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+}));
+app.use(express.json({
+  limit: "6mb",
+  verify(req, _res, buffer) {
+    req.rawBody = buffer.toString("utf8");
+  },
+}));
+
+const chatLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 12,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  keyGenerator: (req) => req.body?.userId || ipKeyGenerator(req.ip),
 });
 
-// MAIN /api/chat
-app.post("/api/chat", async (req, res) => {
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "cashly-ai", version: VERSION });
+});
+
+app.post("/api/v2/chat", requireSignature, chatLimiter, async (req, res) => {
+  const parsed = chatSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ ok: false, error: "invalid_request" });
+
+  const startedAt = Date.now();
+  const input = parsed.data;
+  const route = pickModel(input.message, input.mode, input.plan, input.analysisMode);
+  const tools = input.vectorStoreId
+    ? [{ type: "file_search", vector_store_ids: [input.vectorStoreId], max_num_results: 6 }]
+    : undefined;
+
   try {
-    const { userId = "guest", message, system, temperature = 0.7, max_tokens = 300 } = req.body;
-
-    if (!message) return res.status(400).json({ error: "message fehlt" });
-
-    await ensureUser(userId);
-    const q = await consumeQuota(userId);
-    if (!q.ok) return res.status(429).json({ error: "Quota exhausted", details: q });
-
-    const data = await readData();
-    const session = data.sessions[userId] || [];
-    const level = LEVELS[data.users[userId].levelId] || LEVELS[4];
-
-    const messages = [
-      {
-  role: "system",
-  content: system || CASHLY_SYSTEM_PROMPT
-},
-
-      ...session,
-      { role: "user", content: message }
-    ];
-
-    const payload = {
-      model: level.model,
-      messages,
-      temperature: Number(temperature),
-      max_tokens: Number(max_tokens),
-    };
-
-    const openaiRes = await axios.post("https://api.openai.com/v1/chat/completions", payload, {
-      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
-      timeout: 120000,
+    const response = await openai.responses.create({
+      model: route.model,
+      instructions: buildInstructions(input.mode, input.knowledgeContext, input.plan, input.analysisMode),
+      input: [...normalizeHistory(input.history), { role: "user", content: input.message }],
+      reasoning: { effort: route.reasoning },
+      text: { verbosity: "medium" },
+      tools,
+      include: tools ? ["file_search_call.results"] : undefined,
+      max_output_tokens: route.maxOutputTokens,
+      store: false,
+      metadata: {
+        cashly_request_id: input.requestId.slice(0, 64),
+        cashly_mode: input.mode,
+        cashly_plan: input.plan,
+        cashly_analysis: input.analysisMode,
+      },
     });
 
-    let reply = openaiRes.data.choices?.[0]?.message?.content || "(keine Antwort)";
+    const reply = response.output_text?.trim();
+    if (!reply) throw new Error("empty_model_response");
 
-    // Emojis hart entfernen (finale Sicherheit)
-    reply = reply.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '');
+    logEvent("chat.completed", {
+      requestId: input.requestId,
+      userId: crypto.createHash("sha256").update(input.userId).digest("hex").slice(0, 12),
+      mode: input.mode,
+      plan: input.plan,
+      analysisMode: input.analysisMode,
+      model: route.model,
+      route: route.route,
+      durationMs: Date.now() - startedAt,
+      inputTokens: response.usage?.input_tokens || null,
+      outputTokens: response.usage?.output_tokens || null,
+    });
 
-    await pushSession(userId, "user", message);
-    await pushSession(userId, "assistant", reply);
-
-    res.json({
+    return res.json({
       ok: true,
       reply,
-      meta: { userId, remainingRequests: q.remaining },
+      meta: { model: route.model, route: route.route, analysisMode: input.analysisMode, usage: response.usage || null },
     });
-  } catch (err) {
-    console.error("ERROR /api/chat:", err.response?.data || err.message);
-    res.status(500).json({ error: "server_error", details: err.response?.data || err.message });
+  } catch (error) {
+    logEvent("chat.failed", {
+      requestId: input.requestId,
+      mode: input.mode,
+      plan: input.plan,
+      analysisMode: input.analysisMode,
+      durationMs: Date.now() - startedAt,
+      error: error?.name || "Error",
+      status: error?.status || null,
+    });
+    return res.status(502).json({ ok: false, error: "generation_failed" });
   }
 });
 
-// update levelId / extraRequests
-app.post("/api/user/updateLevel", async (req, res) => {
-  const { userId, levelId, extraRequests } = req.body;
-  if (!userId) return res.status(400).json({ error: "userId fehlt" });
+app.post("/api/v2/knowledge/sync", requireSignature, async (req, res) => {
+  const parsed = knowledgeSyncSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ ok: false, error: "invalid_request" });
 
-  const data = await readData();
-  data.users[userId] = data.users[userId] || { id: userId };
-  if (levelId) data.users[userId].levelId = levelId;
-  if (typeof extraRequests === "number") data.users[userId].extraRequests = extraRequests;
+  const startedAt = Date.now();
+  try {
+    const vectorStoreId = await syncKnowledge(parsed.data.documents);
+    if (parsed.data.previousVectorStoreId && parsed.data.previousVectorStoreId !== vectorStoreId) {
+      await deleteVectorStoreWithFiles(parsed.data.previousVectorStoreId);
+    }
 
-  await writeData(data);
-  res.json({ ok: true, user: data.users[userId] });
+    logEvent("knowledge.synced", {
+      requestId: parsed.data.requestId,
+      documents: parsed.data.documents.length,
+      durationMs: Date.now() - startedAt,
+    });
+    return res.json({ ok: true, vectorStoreId, documents: parsed.data.documents.length });
+  } catch (error) {
+    logEvent("knowledge.failed", {
+      requestId: parsed.data.requestId,
+      durationMs: Date.now() - startedAt,
+      error: error?.name || "Error",
+      status: error?.status || null,
+    });
+    return res.status(502).json({ ok: false, error: "knowledge_sync_failed" });
+  }
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.use((_req, res) => res.status(404).json({ ok: false, error: "not_found" }));
+app.use((error, _req, res, _next) => {
+  if (error?.type === "entity.too.large") {
+    return res.status(413).json({ ok: false, error: "payload_too_large" });
+  }
+  if (error instanceof SyntaxError && "body" in error) {
+    return res.status(400).json({ ok: false, error: "invalid_json" });
+  }
+  logEvent("server.error", { error: error?.name || "Error" });
+  return res.status(500).json({ ok: false, error: "server_error" });
+});
 
-app.listen(PORT, () => console.log(`🚀 Cashly AI läuft auf Port ${PORT}`));
+const server = app.listen(PORT, "0.0.0.0", () => {
+  logEvent("server.started", { version: VERSION, port: PORT });
+});
+
+function shutdown(signal) {
+  logEvent("server.stopping", { signal });
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
